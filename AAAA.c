@@ -1,476 +1,128 @@
-// BARC CODE
-#include<stdio.h>
-#include<stdlib.h>
-#include<fcntl.h>
-#include<stdint.h>
-#include<unistd.h>
-#include<sys/mman.h>
-#include<sys/select.h>
+/* ============================================================
+ * SoC SIDE — Complete IRQ Handler with LED Blink + TCP Handshake
+ * ============================================================
+ * Platform : Cyclone V SoC (DE-series or equivalent)
+ *            ARM DS-5 Eclipse / arm-linux-gnueabihf-gcc
+ *
+ * Address map (pb_lwh2f LW bridge @ 0xFF200000):
+ *   sys_id         0x00000000
+ *   led_pio        0x00000010   <- 4 LEDs on bits[3:0]
+ *   button_pio     0x00000020
+ *   dipsw_pio      0x00000030
+ *   pio_ctrl_reg   0x00000040
+ *   pio_status_reg 0x00000060
+ *   ILC            0x00000100
+ *   pcie_0         0x00010000
+ *   irq_pio        0x00040000   <- interrupt source PIO
+ *
+ * PIO register layout (Intel/Altera standard, at each PIO base):
+ *   +0x00 DATA         write=drive output, read=input state
+ *   +0x04 DIRECTION    1=output, 0=input
+ *   +0x08 INTERRUPTMASK 1=interrupt enabled for that bit
+ *   +0x0C EDGECAPTURE  write 1 to clear; must clear in ISR or IRQ won't re-fire
+ *
+ * Flow per interrupt:
+ *   1. read(uio_fd) unblocks  (HW IRQ fired, kernel UIO woke us)
+ *   2. Read irq_count from UIO
+ *   3. Read EDGECAPTURE to confirm which bit fired, then clear it
+ *   4. Blink all 4 LEDs: ON 75ms -> OFF  (immediate visual feedback)
+ *   5. Send "IRQ_HANDLED,board=<ID>,count=<N>" to PC over TCP
+ *   6. Wait for "ACK,board=<ID>,count=<N>" from PC (2s timeout)
+ *   7. Log handshake result to console
+ *   8. write(uio_fd) re-arms the UIO interrupt for next event
+ *   9. Loop
+ * ============================================================ */
 
-#define UIO_DEVICE "/dev/uio0"
-#define FPGA_REG_SIZE 0x1000
-
-int main(){
-    int fd;
-    uint32_t irq_count;
-    volatile uint32_t*fpga_regs;
-    fd = open(UIO_DEVICE,0_RDWR);
-    if(fd<0){
-        perror("Cannot open UIO device");
-        retunr -1;
-    }
-
-    fpga_regs = (volatile uint32_t*) mmap(NULL, FPGA_REG_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-
-    if(fpga_regs == MAP_FAILED){
-        perror("mmap failed");
-        retunr -1;
-    }
-
-    printf("Interrupt handler running... \n");
-
-    while(1){
-        if(read(fd, &irq_count, sizeof(irq_count)) < 0){
-            perror("read failed");
-            break;
-        }
-    }
-
-    printf("Interrupt received : %u\n" , irq_count);
-
-    static unit32_t led_pattern = 0xE;
-    fpga_regs[0] = led_pattern;
-    led_pattern = ((led_pattern<<1) & 0xF | (led_pattern>>3) & 0x1);
-    
-    if(write(fd, &irq_count, sizeof(irq_count))<0){
-        perror("write failed");
-        break;
-    }
-    close(fd);
-    return 0;
-}
-
-
-
-
-
-
-
-
-//DEEPSEEK UPDATED
 #include <stdio.h>
 #include <stdlib.h>
-#include <fcntl.h>
 #include <stdint.h>
+#include <string.h>
+#include <fcntl.h>
 #include <unistd.h>
+#include <errno.h>
 #include <sys/mman.h>
-#include <sys/select.h>
-#include <errno.h>
-
-#define UIO_DEVICE "/dev/uio0"
-#define FPGA_REG_SIZE 0x1000
-
-int main() {
-    int fd;
-    uint32_t irq_count = 0;
-    volatile uint32_t *fpga_regs;
-    
-    // 1. Open UIO device
-    fd = open(UIO_DEVICE, O_RDWR);  // ← Fixed: O_RDWR (letter O)
-    if (fd < 0) {
-        perror("Cannot open UIO device");
-        return -1;  // ← Fixed: return
-    }
-
-    // 2. Memory-map FPGA registers
-    fpga_regs = (volatile uint32_t *)mmap(NULL, FPGA_REG_SIZE, 
-                                          PROT_READ | PROT_WRITE, 
-                                          MAP_SHARED, fd, 0);
-
-    if (fpga_regs == MAP_FAILED) {
-        perror("mmap failed");
-        close(fd);
-        return -1;  // ← Fixed: return
-    }
-
-    printf("Interrupt handler running... Press Ctrl+C to stop.\n");
-    
-    uint32_t led_pattern = 0xE;  // ← Fixed: uint32_t
-    
-    while (1) {
-        // 3. Block until an interrupt occurs
-        if (read(fd, &irq_count, sizeof(irq_count)) < 0) {
-            if (errno == EINTR) {
-                continue;  // Interrupted by signal, retry
-            }
-            perror("read failed");
-            break;
-        }
-        
-        // 4. INTERRUPT RECEIVED! Process it here
-        printf("Interrupt received! Count: %u\n", irq_count);
-        
-        // 5. Toggle LED pattern (active-low logic)
-        fpga_regs[0] = led_pattern;  // Write to FPGA register
-        led_pattern = ((led_pattern << 1) & 0xF) | ((led_pattern >> 3) & 0x1);
-        
-        // 6. Acknowledge interrupt to UIO driver (write back the count)
-        if (write(fd, &irq_count, sizeof(irq_count)) < 0) {
-            perror("write failed");
-            break;
-        }
-        
-        // 7. UDP/Ethernet Notification (YOU WILL ADD THIS)
-        // send_udp_message(irq_count);
-    }
-    
-    // 8. Cleanup
-    munmap((void *)fpga_regs, FPGA_REG_SIZE);
-    close(fd);
-    printf("Interrupt handler stopped.\n");
-    
-    return 0;
-}
-
-
-
-
-
-
-
-
-
-
-
-
-// DEEPSEEK -> CLAUDE UPDATE
-/* ============================================================
- * PC SIDE: TCP listener for SoC interrupt handshake
- * ============================================================
- * Flow:
- *   1. Listens on PORT for SoC to connect
- *   2. On receiving "IRQ_HANDLED,count=<N>" from SoC
- *   3. Sends back "ACK,count=<N>" to complete the handshake
- * ============================================================ */
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <arpa/inet.h>
-
-#define PORT      5000
-#define BUF_SIZE  64
-
-int main(void) {
-    int server_fd, client_fd;
-    struct sockaddr_in server_addr, client_addr;
-    socklen_t client_len = sizeof(client_addr);
-
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) {
-        perror("socket failed");
-        return -1;
-    }
-
-    int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family      = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port        = htons(PORT);
-
-    if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        perror("bind failed");
-        close(server_fd);
-        return -1;
-    }
-
-    if (listen(server_fd, 1) < 0) {
-        perror("listen failed");
-        close(server_fd);
-        return -1;
-    }
-
-    printf("Listening for SoC on port %d...\n", PORT);
-
-    client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
-    if (client_fd < 0) {
-        perror("accept failed");
-        close(server_fd);
-        return -1;
-    }
-
-    printf("SoC connected from %s\n", inet_ntoa(client_addr.sin_addr));
-
-    char buf[BUF_SIZE];
-    while (1) {
-        memset(buf, 0, sizeof(buf));
-        ssize_t recvd = recv(client_fd, buf, sizeof(buf) - 1, 0);
-
-        if (recvd <= 0) {
-            printf("SoC disconnected\n");
-            break;
-        }
-
-        buf[recvd] = '\0';
-        printf("Received: %s", buf);
-
-        uint32_t count = 0;
-        if (sscanf(buf, "IRQ_HANDLED,count=%u", &count) == 1) {
-            char ack[BUF_SIZE];
-            int ack_len = snprintf(ack, sizeof(ack), "ACK,count=%u\n", count);
-            send(client_fd, ack, ack_len, 0);
-            printf("Sent: %s", ack);
-        }
-    }
-
-    close(client_fd);
-    close(server_fd);
-    return 0;
-}
-
-
-
-
-
-
-
-
-
-
-
-// CLAUDE -> DEEPSEEK UPDATE
-// Version 2.0: Enhanced PC Listener
-
-/* ============================================================
- * PC SIDE: Enhanced TCP listener for SoC interrupt handshake
- * ============================================================
- * Improvements:
- *   - Multiple connection support via fork()
- *   - recv() timeout
- *   - Better error handling
- *   - Connection monitoring
- * ============================================================ */
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <errno.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <arpa/inet.h>
-#include <signal.h>
 
-#define PORT      5000
-#define BUF_SIZE  64
-#define TIMEOUT_SEC 5
+/* =========================================================
+ * Hardware constants — derived from your address map
+ * ========================================================= */
 
-void handle_client(int client_fd, struct sockaddr_in client_addr) {
-    char buf[BUF_SIZE];
-    char client_ip[INET_ADDRSTRLEN];
-    
-    inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
-    printf("[Client %s] Connected\n", client_ip);
-    
-    // Set receive timeout
-    struct timeval tv;
-    tv.tv_sec = TIMEOUT_SEC;
-    tv.tv_usec = 0;
-    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    
-    while (1) {
-        memset(buf, 0, sizeof(buf));
-        ssize_t recvd = recv(client_fd, buf, sizeof(buf) - 1, 0);
-        
-        if (recvd < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // Timeout - connection still alive
-                continue;
-            }
-            perror("recv failed");
-            break;
-        } else if (recvd == 0) {
-            printf("[Client %s] Disconnected\n", client_ip);
-            break;
-        }
-        
-        buf[recvd] = '\0';
-        printf("[Client %s] Received: %s", client_ip, buf);
-        
-        uint32_t count = 0;
-        if (sscanf(buf, "IRQ_HANDLED,count=%u", &count) == 1) {
-            char ack[BUF_SIZE];
-            int ack_len = snprintf(ack, sizeof(ack), "ACK,count=%u\n", count);
-            send(client_fd, ack, ack_len, 0);
-            printf("[Client %s] Sent: %s", client_ip, ack);
-        } else {
-            // Invalid message format
-            char error_msg[] = "ERROR,invalid_format\n";
-            send(client_fd, error_msg, strlen(error_msg), 0);
-            printf("[Client %s] Invalid format received\n", client_ip);
-        }
-    }
-    
-    close(client_fd);
-    printf("[Client %s] Connection closed\n", client_ip);
+/* LW HPS-to-FPGA bridge physical base (Cyclone V standard) */
+#define LW_BRIDGE_BASE      0xFF200000UL
+
+/* Total span we need to mmap: up to irq_pio end = 0x40010
+   Round up to next 4K page boundary = 0x41000             */
+#define LW_BRIDGE_SPAN      0x41000
+
+/* --- LED PIO (base 0x10 from bridge) --- */
+#define LED_PIO_OFFSET      0x00000010
+#define LED_DATA_REG        (LED_PIO_OFFSET + 0x00)   /* write to drive LEDs */
+
+#define LED_ALL_ON          0x0F    /* bits[3:0] = 4 LEDs all ON  */
+#define LED_ALL_OFF         0x00    /* all LEDs off               */
+
+/* --- IRQ PIO (base 0x40000 from bridge) --- */
+#define IRQ_PIO_OFFSET      0x00040000
+#define IRQ_DATA_REG        (IRQ_PIO_OFFSET + 0x00)
+#define IRQ_INTMASK_REG     (IRQ_PIO_OFFSET + 0x08)   /* set bit to enable IRQ */
+#define IRQ_EDGECAP_REG     (IRQ_PIO_OFFSET + 0x0C)   /* write 1 to clear edge  */
+
+/* --- pio_status_reg (base 0x60) --- */
+#define STATUS_REG_OFFSET   0x00000060
+#define STATUS_DATA_REG     (STATUS_REG_OFFSET + 0x00)
+
+/* --- pio_ctrl_reg (base 0x40) --- */
+#define CTRL_REG_OFFSET     0x00000040
+#define CTRL_DATA_REG       (CTRL_REG_OFFSET + 0x00)
+
+/* =========================================================
+ * Network configuration — edit before flashing each board
+ * ========================================================= */
+#define PC_IP_ADDR          "192.168.1.10"  /* your PC's IP on the same subnet */
+#define PC_PORT             5000
+#define BOARD_ID            "SOC_01"        /* UNIQUE per board: SOC_01, SOC_02 ... */
+
+/* =========================================================
+ * Tunables
+ * ========================================================= */
+#define UIO_DEVICE          "/dev/uio0"
+#define LED_BLINK_MS        75              /* blink duration in milliseconds */
+#define ACK_TIMEOUT_SEC     2
+#define MSG_BUF_SIZE        96
+
+/* =========================================================
+ * Helpers — register read/write through the mmap'd window
+ * ========================================================= */
+static inline void reg_write(volatile uint32_t *bridge, uint32_t offset_bytes, uint32_t val)
+{
+    /* offset is in bytes; bridge pointer is uint32_t* so divide by 4 for index */
+    bridge[offset_bytes / 4] = val;
 }
 
-int main(void) {
-    int server_fd;
-    struct sockaddr_in server_addr;
-    
-    // Ignore SIGCHLD to prevent zombie processes
-    signal(SIGCHLD, SIG_IGN);
-    
-    server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) {
-        perror("socket failed");
-        return -1;
-    }
-    
-    int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    
-    memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons(PORT);
-    
-    if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        perror("bind failed");
-        close(server_fd);
-        return -1;
-    }
-    
-    if (listen(server_fd, 5) < 0) {  // ← Increased backlog
-        perror("listen failed");
-        close(server_fd);
-        return -1;
-    }
-    
-    printf("========================================\n");
-    printf("  SoC Interrupt Handshake Server\n");
-    printf("  Listening on port %d\n", PORT);
-    printf("  Ready for SoC connections...\n");
-    printf("========================================\n");
-    
-    while (1) {
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        
-        int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
-        if (client_fd < 0) {
-            if (errno == EINTR) {
-                continue;  // Interrupted by signal, retry
-            }
-            perror("accept failed");
-            continue;
-        }
-        
-        // Fork to handle client in child process
-        pid_t pid = fork();
-        if (pid == 0) {
-            // Child process
-            close(server_fd);  // Child doesn't need listening socket
-            handle_client(client_fd, client_addr);
-            exit(0);
-        } else if (pid > 0) {
-            // Parent process
-            close(client_fd);  // Parent doesn't need client socket
-        } else {
-            perror("fork failed");
-            close(client_fd);
-        }
-    }
-    
-    close(server_fd);
-    return 0;
+static inline uint32_t reg_read(volatile uint32_t *bridge, uint32_t offset_bytes)
+{
+    return bridge[offset_bytes / 4];
 }
 
-
-// Integration with Your SoC Code
-// Your SoC-side code (the interrupt handler) should now send messages like this:
-
-// Inside your SoC interrupt handler
-void send_interrupt_notification(uint32_t irq_count) {
-    int sockfd;
-    struct sockaddr_in server_addr;
-    char msg[64];
-    
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd < 0) return;
-    
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(5000);  // PC port
-    inet_pton(AF_INET, "192.168.0.100", &server_addr.sin_addr);  // PC IP
-    
-    if (connect(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        close(sockfd);
-        return;  // PC not listening
-    }
-    
-    // Send message
-    snprintf(msg, sizeof(msg), "IRQ_HANDLED,count=%u\n", irq_count);
-    send(sockfd, msg, strlen(msg), 0);
-    
-    // Wait for ACK
-    char ack[64];
-    recv(sockfd, ack, sizeof(ack) - 1, 0);
-    printf("PC replied: %s", ack);
-    
-    close(sockfd);
+/* =========================================================
+ * LED blink — all 4 LEDs ON for blink_ms, then OFF
+ * ========================================================= */
+static void blink_leds(volatile uint32_t *bridge, int blink_ms)
+{
+    reg_write(bridge, LED_DATA_REG, LED_ALL_ON);
+    usleep(blink_ms * 1000);
+    reg_write(bridge, LED_DATA_REG, LED_ALL_OFF);
 }
 
-
-
-
-
-
-
-
-
-
-//DEEPSEEK -> CLAUDE UPDATED
-/* ============================================================
- * SoC SIDE: Interrupt Service Routine + Ethernet Handshake
- * ============================================================
- * Flow:
- *   1. FPGA interrupt fires -> UIO read() unblocks (this is our ISR trigger)
- *   2. irq_count is read from UIO
- *   3. A message "IRQ_HANDLED,count=<N>" is sent to PC over TCP
- *   4. SoC waits for PC to send back "ACK,count=<N>"
- *   5. Only after ACK is received -> LED pattern toggles
- *      (LED = visual confirmation that PC acknowledged the interrupt)
- *   6. write(fd) re-arms the interrupt at the UIO driver level
- *   7. Loop back and block on next interrupt
- * ============================================================ */
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <fcntl.h>
-#include <stdint.h>
-#include <unistd.h>
-#include <string.h>
-#include <sys/mman.h>
-#include <sys/socket.h>
-#include <arpa/inet.h>
-
-#define UIO_DEVICE     "/dev/uio0"
-#define FPGA_REG_SIZE  0x1000
-
-#define PC_IP_ADDR     "192.168.1.10"   /* <-- set to your PC's IP */
-#define PC_PORT        5000             /* <-- must match PC listener port */
-#define BOARD_ID       "SOC_01"         /* <-- give each board a unique ID */
-
-#define MSG_BUF_SIZE   96
-#define ACK_TIMEOUT_SEC 2                /* how long to wait for PC's ACK */
-
-/* ---- Connects (or reconnects) to PC. Returns valid socket fd or -1. ---- */
-int connect_to_pc(void) {
+/* =========================================================
+ * TCP: connect to PC listener
+ * Returns a valid socket fd, or -1 on failure.
+ * Sets a receive timeout so recv() never blocks forever.
+ * ========================================================= */
+static int connect_to_pc(void)
+{
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
         perror("socket() failed");
@@ -488,181 +140,273 @@ int connect_to_pc(void) {
         return -1;
     }
 
-    if (connect(sock, (struct sockaddr*)&pc_addr, sizeof(pc_addr)) < 0) {
+    if (connect(sock, (struct sockaddr *)&pc_addr, sizeof(pc_addr)) < 0) {
         perror("connect to PC failed");
         close(sock);
         return -1;
     }
 
-    /* Set a receive timeout so we never block forever waiting for an ACK */
-    struct timeval tv;
-    tv.tv_sec  = ACK_TIMEOUT_SEC;
-    tv.tv_usec = 0;
+    /* Never block forever waiting for an ACK */
+    struct timeval tv = { ACK_TIMEOUT_SEC, 0 };
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    printf("Connected to PC at %s:%d\n", PC_IP_ADDR, PC_PORT);
+    printf("[NET] Connected to PC %s:%d as board %s\n", PC_IP_ADDR, PC_PORT, BOARD_ID);
     return sock;
 }
 
-int main(void) {
-    int fd;
-    int pc_sock;
-    uint32_t irq_count;
-    volatile uint32_t *fpga_regs;
-    static uint32_t led_pattern = 0xE;
+/* =========================================================
+ * TCP: send IRQ_HANDLED message and wait for ACK.
+ * Returns 1 on successful handshake, 0 on any failure.
+ * Will attempt one reconnect if the initial send fails.
+ * pc_sock is updated in place if reconnect happens.
+ * ========================================================= */
+static int do_handshake(int *pc_sock, uint32_t irq_count)
+{
+    char msg[MSG_BUF_SIZE];
+    int  msg_len = snprintf(msg, sizeof(msg),
+                            "IRQ_HANDLED,board=%s,count=%u\n",
+                            BOARD_ID, irq_count);
 
-    /* ---- Open UIO device handle ---- */
-    fd = open(UIO_DEVICE, O_RDWR);
-    if (fd < 0) {
-        perror("Cannot open UIO device");
+    /* Reconnect if we lost the socket at some point */
+    if (*pc_sock < 0)
+        *pc_sock = connect_to_pc();
+
+    if (*pc_sock < 0) {
+        fprintf(stderr, "[NET] No connection to PC, skipping handshake\n");
+        return 0;
+    }
+
+    /* --- Send --- */
+    ssize_t sent = send(*pc_sock, msg, msg_len, 0);
+    if (sent < 0) {
+        perror("[NET] send failed, attempting reconnect");
+        close(*pc_sock);
+        *pc_sock = connect_to_pc();
+        if (*pc_sock < 0) return 0;
+        sent = send(*pc_sock, msg, msg_len, 0);
+        if (sent < 0) {
+            perror("[NET] send failed after reconnect");
+            return 0;
+        }
+    }
+    printf("[NET] Sent    -> %s", msg);
+
+    /* --- Wait for ACK --- */
+    char ack_buf[MSG_BUF_SIZE];
+    memset(ack_buf, 0, sizeof(ack_buf));
+    ssize_t recvd = recv(*pc_sock, ack_buf, sizeof(ack_buf) - 1, 0);
+
+    if (recvd <= 0) {
+        if (recvd == 0)
+            fprintf(stderr, "[NET] PC closed the connection\n");
+        else if (errno == EAGAIN || errno == EWOULDBLOCK)
+            fprintf(stderr, "[NET] ACK timed out after %ds\n", ACK_TIMEOUT_SEC);
+        else
+            perror("[NET] recv failed");
+        close(*pc_sock);
+        *pc_sock = -1;
+        return 0;
+    }
+
+    ack_buf[recvd] = '\0';
+    printf("[NET] Received <- %s", ack_buf);
+
+    /* --- Validate ACK: must match our board + count --- */
+    char     acked_board[32];
+    uint32_t acked_count = 0;
+    if (sscanf(ack_buf, "ACK,board=%31[^,],count=%u", acked_board, &acked_count) == 2
+        && acked_count == irq_count
+        && strcmp(acked_board, BOARD_ID) == 0)
+    {
+        return 1;  /* handshake complete */
+    }
+
+    fprintf(stderr, "[NET] ACK mismatch (got board=%s count=%u, expected board=%s count=%u)\n",
+            acked_board, acked_count, BOARD_ID, irq_count);
+    return 0;
+}
+
+/* =========================================================
+ * main
+ * ========================================================= */
+int main(void)
+{
+    int              uio_fd;
+    int              pc_sock;
+    uint32_t         uio_irq_count;
+    uint32_t         irq_total = 0;
+    volatile uint32_t *bridge;
+
+    printf("==============================================\n");
+    printf("  SoC IRQ Handler — Board: %s\n", BOARD_ID);
+    printf("  LED blink: %d ms per interrupt\n", LED_BLINK_MS);
+    printf("  PC target: %s:%d\n", PC_IP_ADDR, PC_PORT);
+    printf("==============================================\n\n");
+
+    /* --------------------------------------------------
+     * 1. Open UIO device (handle to FPGA interrupt)
+     * -------------------------------------------------- */
+    uio_fd = open(UIO_DEVICE, O_RDWR);
+    if (uio_fd < 0) {
+        perror("Cannot open " UIO_DEVICE);
         return -1;
     }
 
-    /* ---- Map FPGA register space (used to drive LEDs) ---- */
-    fpga_regs = (volatile uint32_t *) mmap(NULL, FPGA_REG_SIZE,
-                                            PROT_READ | PROT_WRITE,
-                                            MAP_SHARED, fd, 0);
-    if (fpga_regs == MAP_FAILED) {
+    /* --------------------------------------------------
+     * 2. mmap the LW bridge so we can access all PIOs
+     *    directly from userspace without /dev/mem tricks
+     * -------------------------------------------------- */
+    bridge = (volatile uint32_t *) mmap(NULL,
+                                         LW_BRIDGE_SPAN,
+                                         PROT_READ | PROT_WRITE,
+                                         MAP_SHARED,
+                                         uio_fd, 0);
+    if (bridge == MAP_FAILED) {
         perror("mmap failed");
-        close(fd);
+        close(uio_fd);
         return -1;
     }
 
-    /* ---- Connect to PC once at startup ---- */
+    /* --------------------------------------------------
+     * 3. Initialise hardware
+     * -------------------------------------------------- */
+
+    /* LEDs off — known state */
+    reg_write(bridge, LED_DATA_REG, LED_ALL_OFF);
+    printf("[HW] LEDs initialised to OFF\n");
+
+    /* IRQ PIO: enable interrupt on bit 0, clear any stale edge capture */
+    reg_write(bridge, IRQ_INTMASK_REG, 0x1);   /* unmask bit 0 */
+    reg_write(bridge, IRQ_EDGECAP_REG, 0x1);   /* clear any pending edge */
+    printf("[HW] IRQ PIO interrupt mask enabled, edge capture cleared\n");
+
+    /* Snapshot status/ctrl registers for diagnostic */
+    uint32_t status_val = reg_read(bridge, STATUS_DATA_REG);
+    uint32_t ctrl_val   = reg_read(bridge, CTRL_DATA_REG);
+    printf("[HW] pio_status_reg = 0x%08X\n", status_val);
+    printf("[HW] pio_ctrl_reg   = 0x%08X\n", ctrl_val);
+
+    /* --------------------------------------------------
+     * 4. Connect to PC listener
+     * -------------------------------------------------- */
     pc_sock = connect_to_pc();
-    if (pc_sock < 0) {
-        fprintf(stderr, "Initial connection to PC failed, will retry on first interrupt\n");
-    }
+    if (pc_sock < 0)
+        fprintf(stderr, "[NET] Initial connect failed, will retry on first interrupt\n");
 
-    printf("Interrupt handler running...\n");
+    printf("\n[MAIN] Waiting for interrupts...\n\n");
 
-    /* ================= Main ISR loop ================= */
+    /* ==================================================
+     * 5. Main ISR loop — one iteration per interrupt
+     * ================================================== */
     while (1) {
 
-        /* Blocks until FPGA interrupt fires; UIO returns the count */
-        if (read(fd, &irq_count, sizeof(irq_count)) < 0) {
-            perror("read failed");
+        /* --- Block here until FPGA IRQ fires ---
+         * The UIO kernel driver handles the actual HW interrupt, clears it
+         * at the GIC level, then wakes us here. It returns the cumulative
+         * interrupt count into uio_irq_count.                            */
+        if (read(uio_fd, &uio_irq_count, sizeof(uio_irq_count)) < 0) {
+            perror("[UIO] read failed");
             break;
         }
 
-        printf("Interrupt received: count = %u\n", irq_count);
+        irq_total++;
+        printf("--- Interrupt #%u (UIO count=%u) ---\n", irq_total, uio_irq_count);
 
-        /* ---- Build "interrupt handled" message ---- */
-        char msg[MSG_BUF_SIZE];
-        int msg_len = snprintf(msg, sizeof(msg), "IRQ_HANDLED,board=%s,count=%u\n", BOARD_ID, irq_count);
+        /* --- Clear the EDGECAPTURE register on irq_pio ---
+         * CRITICAL: if you don't clear this, the PIO will keep asserting
+         * the interrupt line and the next re-arm will fire immediately.  */
+        uint32_t edge = reg_read(bridge, IRQ_EDGECAP_REG);
+        printf("[HW] irq_pio EDGECAPTURE = 0x%X (clearing)\n", edge);
+        reg_write(bridge, IRQ_EDGECAP_REG, edge);   /* write-1-to-clear */
 
-        int handshake_ok = 0;
+        /* --- Blink all 4 LEDs for LED_BLINK_MS milliseconds ---
+         * This is instant visual confirmation that the ISR has fired.   */
+        printf("[LED] Blinking all 4 LEDs for %d ms\n", LED_BLINK_MS);
+        blink_leds(bridge, LED_BLINK_MS);
 
-        /* Reconnect if we don't currently have a live socket */
-        if (pc_sock < 0) {
-            pc_sock = connect_to_pc();
-        }
-
-        if (pc_sock >= 0) {
-            ssize_t sent = send(pc_sock, msg, msg_len, 0);
-
-            if (sent < 0) {
-                perror("send failed, attempting reconnect");
-                close(pc_sock);
-                pc_sock = connect_to_pc();
-                if (pc_sock >= 0) {
-                    sent = send(pc_sock, msg, msg_len, 0);
-                }
-            }
-
-            if (sent >= 0) {
-                printf("Sent to PC: %s", msg);
-
-                /* ---- Wait for PC's ACK (completes the handshake) ---- */
-                char ack_buf[MSG_BUF_SIZE];
-                memset(ack_buf, 0, sizeof(ack_buf));
-                ssize_t recvd = recv(pc_sock, ack_buf, sizeof(ack_buf) - 1, 0);
-
-                if (recvd > 0) {
-                    ack_buf[recvd] = '\0';
-                    printf("Received from PC: %s\n", ack_buf);
-
-                    /* Basic check: does ACK reference our board + count? */
-                    char acked_board[32];
-                    uint32_t acked_count = 0;
-                    if (sscanf(ack_buf, "ACK,board=%31[^,],count=%u", acked_board, &acked_count) == 2
-                        && acked_count == irq_count
-                        && strcmp(acked_board, BOARD_ID) == 0) {
-                        handshake_ok = 1;
-                    } else {
-                        fprintf(stderr, "ACK did not match expected board/count\n");
-                    }
-                } else if (recvd == 0) {
-                    fprintf(stderr, "PC closed connection\n");
-                    close(pc_sock);
-                    pc_sock = -1;
-                } else {
-                    perror("recv (waiting for ACK) failed or timed out");
-                }
-            }
-        }
-
-        /* ---- LED feedback: only toggles once handshake is confirmed ---- */
-        if (handshake_ok) {
-            printf("Handshake complete for interrupt %u\n", irq_count);
-            fpga_regs[0] = led_pattern;
-            led_pattern = ((led_pattern << 1) & 0xF) | ((led_pattern >> 3) & 0x1);
+        /* --- TCP handshake with PC --- */
+        int ok = do_handshake(&pc_sock, irq_total);
+        if (ok) {
+            printf("[HANDSHAKE] Complete for interrupt #%u — PC acknowledged\n", irq_total);
         } else {
-            fprintf(stderr, "Handshake failed for interrupt %u, LED not updated\n", irq_count);
+            fprintf(stderr, "[HANDSHAKE] FAILED for interrupt #%u\n", irq_total);
         }
 
-        /* ---- Re-arm interrupt at UIO level for next event ---- */
-        if (write(fd, &irq_count, sizeof(irq_count)) < 0) {
-            perror("write (re-arm) failed");
+        /* --- Re-arm UIO interrupt ---
+         * Writing back to uio_fd tells the UIO kernel driver to re-enable
+         * the interrupt at the GIC level, so the next HW IRQ wakes us.  */
+        if (write(uio_fd, &uio_irq_count, sizeof(uio_irq_count)) < 0) {
+            perror("[UIO] write (re-arm) failed");
             break;
         }
+
+        printf("[UIO] Interrupt re-armed, waiting for next event\n\n");
     }
 
+    /* Cleanup */
+    reg_write(bridge, LED_DATA_REG, LED_ALL_OFF);   /* LEDs off on exit */
     if (pc_sock >= 0) close(pc_sock);
-    munmap((void*)fpga_regs, FPGA_REG_SIZE);
-    close(fd);
+    munmap((void *)bridge, LW_BRIDGE_SPAN);
+    close(uio_fd);
     return 0;
 }
 
 
 
+
+
+
+
+
+
 /* ============================================================
- * PC SIDE: Multi-SoC TCP listener for interrupt handshake
+ * PC SIDE — Multi-SoC TCP Listener
  * ============================================================
- * - fork()-per-connection: each SoC gets its own child process,
- *   so a slow/stuck board can never block another board's ACKs.
- * - Board identity included in the protocol so concurrent SoCs
- *   with overlapping irq_count values can still be told apart
- *   in logs.
+ * Receives "IRQ_HANDLED,board=<ID>,count=<N>" from any SoC,
+ * logs it, and sends back "ACK,board=<ID>,count=<N>".
+ * fork()-per-connection so multiple SoC boards are handled
+ * concurrently with zero cross-talk.
  * ============================================================ */
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
-#include <stdint.h>
+#include <time.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <arpa/inet.h>
-#include <signal.h>
 
-#define PORT        5000
-#define BUF_SIZE    96
-#define TIMEOUT_SEC 5
-#define MAX_BOARD_ID_LEN 32
+#define PORT            5000
+#define BUF_SIZE        96
+#define TIMEOUT_SEC     5
+#define MAX_BOARD_ID    32
 
-void handle_client(int client_fd, struct sockaddr_in client_addr) {
-    char buf[BUF_SIZE];
+/* Print a timestamped log line */
+static void logmsg(const char *board, const char *dir, const char *text)
+{
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    printf("[%02d:%02d:%02d][board=%-8s]%s %s",
+           t->tm_hour, t->tm_min, t->tm_sec, board, dir, text);
+    fflush(stdout);
+}
+
+static void handle_client(int client_fd, struct sockaddr_in client_addr)
+{
     char client_ip[INET_ADDRSTRLEN];
+    char buf[BUF_SIZE];
 
-    inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
-    printf("[%s] Connected\n", client_ip);
+    inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
 
-    struct timeval tv;
-    tv.tv_sec  = TIMEOUT_SEC;
-    tv.tv_usec = 0;
+    /* Idle timeout on recv so a dead SoC doesn't park a process forever */
+    struct timeval tv = { TIMEOUT_SEC, 0 };
     setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    printf("[%s] SoC connected\n", client_ip);
 
     while (1) {
         memset(buf, 0, sizeof(buf));
@@ -670,31 +414,40 @@ void handle_client(int client_fd, struct sockaddr_in client_addr) {
 
         if (recvd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                continue;  /* idle timeout, board still connected, keep waiting */
+                /* Idle timeout — SoC still alive, just quiet */
+                continue;
             }
-            perror("recv failed");
+            perror("recv error");
             break;
-        } else if (recvd == 0) {
-            printf("[%s] Disconnected\n", client_ip);
+        }
+        if (recvd == 0) {
+            printf("[%s] SoC disconnected cleanly\n", client_ip);
             break;
         }
 
         buf[recvd] = '\0';
-        printf("[%s] Received: %s", client_ip, buf);
 
-        char board_id[MAX_BOARD_ID_LEN];
+        char     board_id[MAX_BOARD_ID];
         uint32_t count = 0;
 
-        /* Protocol: "IRQ_HANDLED,board=<id>,count=<N>" */
+        /* Expected format: "IRQ_HANDLED,board=<id>,count=<N>\n" */
         if (sscanf(buf, "IRQ_HANDLED,board=%31[^,],count=%u", board_id, &count) == 2) {
+
+            logmsg(board_id, " -> RECV:", buf);
+
+            /* Build and send the ACK */
             char ack[BUF_SIZE];
-            int ack_len = snprintf(ack, sizeof(ack), "ACK,board=%s,count=%u\n", board_id, count);
+            int  ack_len = snprintf(ack, sizeof(ack),
+                                    "ACK,board=%s,count=%u\n", board_id, count);
             send(client_fd, ack, ack_len, 0);
-            printf("[%s] Sent: %s", client_ip, ack);
+
+            logmsg(board_id, " <- SENT:", ack);
+
         } else {
-            const char *error_msg = "ERROR,invalid_format\n";
-            send(client_fd, error_msg, strlen(error_msg), 0);
-            printf("[%s] Invalid format received\n", client_ip);
+            /* Malformed packet — tell the SoC explicitly */
+            const char *err = "ERROR,invalid_format\n";
+            send(client_fd, err, strlen(err), 0);
+            fprintf(stderr, "[%s] Malformed packet: %s\n", client_ip, buf);
         }
     }
 
@@ -702,17 +455,16 @@ void handle_client(int client_fd, struct sockaddr_in client_addr) {
     printf("[%s] Connection closed\n", client_ip);
 }
 
-int main(void) {
+int main(void)
+{
     int server_fd;
     struct sockaddr_in server_addr;
 
-    signal(SIGCHLD, SIG_IGN);  /* auto-reap finished children, no zombies */
+    /* Auto-reap finished child processes (no zombie accumulation) */
+    signal(SIGCHLD, SIG_IGN);
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) {
-        perror("socket failed");
-        return -1;
-    }
+    if (server_fd < 0) { perror("socket"); return -1; }
 
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -722,43 +474,41 @@ int main(void) {
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port        = htons(PORT);
 
-    if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        perror("bind failed");
-        close(server_fd);
-        return -1;
+    if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("bind"); close(server_fd); return -1;
+    }
+    if (listen(server_fd, 8) < 0) {
+        perror("listen"); close(server_fd); return -1;
     }
 
-    if (listen(server_fd, 8) < 0) {   /* a few more boards' worth of backlog */
-        perror("listen failed");
-        close(server_fd);
-        return -1;
-    }
-
-    printf("========================================\n");
+    printf("==============================================\n");
     printf("  Multi-SoC Interrupt Handshake Server\n");
     printf("  Listening on port %d\n", PORT);
-    printf("========================================\n");
+    printf("  Waiting for SoC boards to connect...\n");
+    printf("==============================================\n\n");
 
     while (1) {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
 
-        int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
+        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
         if (client_fd < 0) {
             if (errno == EINTR) continue;
-            perror("accept failed");
+            perror("accept");
             continue;
         }
 
         pid_t pid = fork();
         if (pid == 0) {
-            close(server_fd);                       /* child doesn't listen */
+            /* Child: handle this one SoC, parent's socket not needed */
+            close(server_fd);
             handle_client(client_fd, client_addr);
             exit(0);
         } else if (pid > 0) {
-            close(client_fd);                        /* parent doesn't serve */
+            /* Parent: doesn't serve clients directly */
+            close(client_fd);
         } else {
-            perror("fork failed");
+            perror("fork");
             close(client_fd);
         }
     }
