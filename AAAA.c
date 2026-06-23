@@ -1,3 +1,220 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/select.h>
+#include <errno.h>
+
+#define UIO_DEVICE      "/dev/uio0"
+#define FPGA_REG_SIZE   0x1000
+
+/* Platform Designer Addresses (from your list) */
+#define PIO_STATUS_REG_BASE     0x60    /* 0x00000060 - 0x0000006F */
+#define PIO_CTRL_REG_BASE       0x40    /* 0x00000040 - 0x0000005F */
+#define LED_PIO_BASE            0x10    /* 0x00000010 - 0x0000001F */
+#define BUTTON_PIO_BASE         0x20    /* 0x00000020 - 0x0000002F */
+#define DIPSW_PIO_BASE          0x30    /* 0x00000030 - 0x0000003F */
+#define IRQ_PIO_BASE            0x40000 /* 0x00040000 - 0x0004000F */
+
+/* Offsets relative to mmap base (which is 0xFF200000 for Lightweight H2F) */
+#define LW_H2F_BASE             0xFF200000
+
+/* Calculate absolute addresses for mmap region */
+#define PIO_STATUS_REG_OFFSET   (PIO_STATUS_REG_BASE - LW_H2F_BASE)
+#define PIO_CTRL_REG_OFFSET     (PIO_CTRL_REG_BASE - LW_H2F_BASE)
+#define LED_PIO_OFFSET          (LED_PIO_BASE - LW_H2F_BASE)
+#define BUTTON_PIO_OFFSET       (BUTTON_PIO_BASE - LW_H2F_BASE)
+#define DIPSW_PIO_OFFSET        (DIPSW_PIO_BASE - LW_H2F_BASE)
+#define IRQ_PIO_OFFSET          (IRQ_PIO_BASE - LW_H2F_BASE)
+
+/* LED pattern defines (active-low: 0 = ON, 1 = OFF) */
+#define LED_PATTERN_START       0xE     /* 1110 = LED0 ON, others OFF */
+#define LED_ALL_OFF             0xF     /* 1111 = All OFF */
+#define LED_ALL_ON              0x0     /* 0000 = All ON */
+
+/* Interrupt message defines */
+#define IRQ_MESSAGE_START       0xAA    /* Marker for interrupt start */
+#define IRQ_MESSAGE_END         0x55    /* Marker for interrupt end */
+
+/* Simple delay for SignalTap visibility (in microseconds) */
+void micro_delay(useconds_t us) {
+    usleep(us);
+}
+
+int main() {
+    int fd;
+    uint32_t irq_count = 0;
+    volatile uint32_t *fpga_regs;
+    volatile uint32_t *led_pio;
+    volatile uint32_t *pio_ctrl_reg;
+    volatile uint32_t *pio_status_reg;
+    volatile uint32_t *button_pio;
+    volatile uint32_t *dipsw_pio;
+    volatile uint32_t *irq_pio;
+    
+    uint32_t led_pattern = LED_PATTERN_START;
+    uint32_t interrupt_occurred = 0;
+    
+    /* ---- 1. Open UIO device ---- */
+    fd = open(UIO_DEVICE, O_RDWR);
+    if (fd < 0) {
+        perror("Cannot open UIO device");
+        return -1;
+    }
+    
+    /* ---- 2. Memory-map FPGA register space ---- */
+    fpga_regs = (volatile uint32_t *)mmap(NULL, FPGA_REG_SIZE,
+                                          PROT_READ | PROT_WRITE,
+                                          MAP_SHARED, fd, 0);
+    
+    if (fpga_regs == MAP_FAILED) {
+        perror("mmap failed");
+        close(fd);
+        return -1;
+    }
+    
+    /* ---- 3. Set up register pointers (relative to mmap base) ---- */
+    led_pio       = (volatile uint32_t *)((uintptr_t)fpga_regs + LED_PIO_OFFSET);
+    pio_ctrl_reg  = (volatile uint32_t *)((uintptr_t)fpga_regs + PIO_CTRL_REG_OFFSET);
+    pio_status_reg= (volatile uint32_t *)((uintptr_t)fpga_regs + PIO_STATUS_REG_OFFSET);
+    button_pio    = (volatile uint32_t *)((uintptr_t)fpga_regs + BUTTON_PIO_OFFSET);
+    dipsw_pio     = (volatile uint32_t *)((uintptr_t)fpga_regs + DIPSW_PIO_OFFSET);
+    irq_pio       = (volatile uint32_t *)((uintptr_t)fpga_regs + IRQ_PIO_OFFSET);
+    
+    /* ---- 4. Initial LED state ---- */
+    *led_pio = LED_ALL_OFF;  // All LEDs OFF initially
+    printf("Initial LEDs: All OFF\n");
+    
+    /* ---- 5. Clear control register ---- */
+    *pio_ctrl_reg = 0x00;
+    *pio_status_reg = 0x00;
+    
+    printf("========================================\n");
+    printf("  Interrupt Handler Running...\n");
+    printf("  UIO Device: %s\n", UIO_DEVICE);
+    printf("  LED PIO Base: 0x%08X\n", LED_PIO_BASE);
+    printf("  CTRL Reg Base: 0x%08X\n", PIO_CTRL_REG_BASE);
+    printf("  STATUS Reg Base: 0x%08X\n", PIO_STATUS_REG_BASE);
+    printf("  Press button to trigger interrupt!\n");
+    printf("========================================\n");
+    printf("\n");
+    
+    /* ---- 6. Main ISR loop ---- */
+    while (1) {
+        /* Block until FPGA interrupt fires */
+        if (read(fd, &irq_count, sizeof(irq_count)) < 0) {
+            if (errno == EINTR) {
+                continue;  // Interrupted by signal, retry
+            }
+            perror("read failed");
+            break;
+        }
+        
+        /* ================================================================
+         * INTERRUPT RECEIVED! 
+         * This is where the ISR (Interrupt Service Routine) executes
+         * ================================================================ */
+        
+        interrupt_occurred = 1;
+        
+        /* ---- 7. Log interrupt ---- */
+        printf("\n");
+        printf("═══════════════════════════════════════════════════════════\n");
+        printf("  🔔 INTERRUPT RECEIVED! Count: %u\n", irq_count);
+        printf("═══════════════════════════════════════════════════════════\n");
+        
+        /* ---- 8. Read current button and DIP switch state ---- */
+        uint32_t button_state = *button_pio;
+        uint32_t dipsw_state = *dipsw_pio;
+        printf("  Button State: 0x%02X  |  DIP Switch: 0x%02X\n", 
+               button_state, dipsw_state);
+        
+        /* ---- 9. WRITE INTERRUPT MESSAGE TO CONTROL REGISTER ---- */
+        /* Step 9a: Write start marker to control register (for SignalTap) */
+        *pio_ctrl_reg = IRQ_MESSAGE_START;
+        printf("  [WRITE] pio_ctrl_reg = 0x%02X (START marker)\n", IRQ_MESSAGE_START);
+        
+        /* Small delay for SignalTap to capture the write */
+        micro_delay(1000);  // 1ms
+        
+        /* Step 9b: Write interrupt count to control register */
+        *pio_ctrl_reg = irq_count & 0xFF;  // Lower 8 bits of count
+        printf("  [WRITE] pio_ctrl_reg = 0x%02X (Count = %u)\n", 
+               irq_count & 0xFF, irq_count);
+        
+        micro_delay(1000);
+        
+        /* Step 9c: Write end marker to control register */
+        *pio_ctrl_reg = IRQ_MESSAGE_END;
+        printf("  [WRITE] pio_ctrl_reg = 0x%02X (END marker)\n", IRQ_MESSAGE_END);
+        
+        micro_delay(1000);
+        
+        /* Step 9d: Write status register to confirm interrupt */
+        *pio_status_reg = irq_count & 0xFF;
+        printf("  [WRITE] pio_status_reg = 0x%02X\n", irq_count & 0xFF);
+        
+        /* ---- 10. TOGGLE LED PATTERN (Visual Confirmation) ---- */
+        *led_pio = led_pattern;
+        printf("  [WRITE] LED Pattern: 0x%02X (", led_pattern);
+        
+        /* Show which LEDs are ON */
+        for (int i = 3; i >= 0; i--) {
+            if ((led_pattern & (1 << i)) == 0) {
+                printf("LED%d ON ", i);
+            } else {
+                printf("LED%d OFF ", i);
+            }
+        }
+        printf(")\n");
+        
+        /* Rotate pattern for next interrupt (right-shift) */
+        led_pattern = ((led_pattern << 1) & 0xF) | ((led_pattern >> 3) & 0x1);
+        
+        /* ---- 11. Write ACKNOWLEDGEMENT to UIO driver ---- */
+        if (write(fd, &irq_count, sizeof(irq_count)) < 0) {
+            perror("write (re-arm) failed");
+            break;
+        }
+        printf("  [UIO] Interrupt re-armed (write count = %u)\n", irq_count);
+        
+        printf("═══════════════════════════════════════════════════════════\n");
+        printf("\n");
+        
+        /* ---- 12. Wait for next interrupt ---- */
+        /* Loop back to read() */
+    }
+    
+    /* ---- 13. Cleanup ---- */
+    *led_pio = LED_ALL_OFF;  // Turn all LEDs OFF
+    *pio_ctrl_reg = 0x00;
+    *pio_status_reg = 0x00;
+    
+    munmap((void *)fpga_regs, FPGA_REG_SIZE);
+    close(fd);
+    printf("\nInterrupt handler stopped.\n");
+    
+    return 0;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 /* ============================================================
  * SoC SIDE — Complete IRQ Handler with LED Blink + TCP Handshake
  * ============================================================
