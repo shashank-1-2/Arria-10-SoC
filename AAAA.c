@@ -1,3 +1,317 @@
+//date: 26/06/26
+#include <stdio.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <string.h>
+#include <errno.h>
+#include <sys/mman.h>
+#include <sys/select.h>
+
+#define UIO_DEVICE          "/dev/uio0"
+#define FPGA_REG_SIZE       0x1000
+
+/* Platform Designer Addresses (from your list) */
+#define LW_H2F_BASE         0xFF200000
+#define PIO_STATUS_REG_BASE 0x00000060
+#define PIO_CTRL_REG_BASE   0x00000040
+#define LED_PIO_BASE        0x00000010
+#define BUTTON_PIO_BASE     0x00000020
+#define DIPSW_PIO_BASE      0x00000030
+#define IRQ_PIO_BASE        0x00040000
+
+/* Offsets for mmap */
+#define PIO_STATUS_REG_OFFSET   (PIO_STATUS_REG_BASE - LW_H2F_BASE)
+#define PIO_CTRL_REG_OFFSET     (PIO_CTRL_REG_BASE - LW_H2F_BASE)
+#define LED_PIO_OFFSET          (LED_PIO_BASE - LW_H2F_BASE)
+#define BUTTON_PIO_OFFSET       (BUTTON_PIO_BASE - LW_H2F_BASE)
+#define DIPSW_PIO_OFFSET        (DIPSW_PIO_BASE - LW_H2F_BASE)
+#define IRQ_PIO_OFFSET          (IRQ_PIO_BASE - LW_H2F_BASE)
+
+/* Interrupt Message Constants */
+#define IRQ_MSG_START           0xAA
+#define IRQ_MSG_END             0x55
+#define IRQ_MSG_IDLE            0x00
+
+/* LED Pattern (Active Low: 0 = ON, 1 = OFF) */
+#define LED_PATTERN_START       0xE     /* 1110 = LED0 ON */
+#define LED_ALL_OFF             0xF
+#define LED_ALL_ON              0x0
+
+/* Interrupt Control Flags */
+#define IRQ_ENABLE              1
+#define IRQ_DISABLE             0
+
+/* Timeouts */
+#define HANDSHAKE_TIMEOUT_MS    100     /* 100ms timeout for handshake */
+#define RETRY_COUNT             3       /* Number of retries */
+
+/* ============================================================
+ * Function: micro_delay
+ * Simple delay for hardware timing
+ * ============================================================ */
+void micro_delay(useconds_t us) {
+    usleep(us);
+}
+
+/* ============================================================
+ * Function: verify_hardware_handshake
+ * Writes to pio_ctrl_reg and verifies via pio_status_reg
+ * Returns: 1 on success, 0 on failure
+ * ============================================================ */
+int verify_hardware_handshake(volatile uint32_t *pio_ctrl_reg, 
+                               volatile uint32_t *pio_status_reg,
+                               uint32_t message) {
+    uint32_t read_back;
+    int retry;
+    
+    /* Step 1: Write the message to control register */
+    *pio_ctrl_reg = message;
+    printf("    [WRITE] pio_ctrl_reg = 0x%02X\n", message);
+    
+    /* Small delay for hardware to propagate */
+    micro_delay(100);
+    
+    /* Step 2: Read back from status register with retries */
+    for (retry = 0; retry < RETRY_COUNT; retry++) {
+        read_back = *pio_status_reg;
+        printf("    [READ]  pio_status_reg = 0x%02X (attempt %d)\n", 
+               read_back, retry + 1);
+        
+        if (read_back == message) {
+            printf("    ✅ HANDSHAKE SUCCESS! Message matched.\n");
+            return 1;
+        }
+        
+        /* Wait before retry */
+        micro_delay(1000);
+    }
+    
+    /* Step 3: Handshake failed */
+    printf("    ❌ HANDSHAKE FAILED! Expected 0x%02X, got 0x%02X\n", 
+           message, read_back);
+    return 0;
+}
+
+/* ============================================================
+ * Function: disable_interrupts
+ * Masks interrupts at the hardware level
+ * ============================================================ */
+void disable_interrupts(volatile uint32_t *irq_pio) {
+    /* Write 0 to interrupt enable register (or set mask bit) */
+    *irq_pio = IRQ_DISABLE;
+    printf("    🔒 Interrupts DISABLED\n");
+    micro_delay(100);
+}
+
+/* ============================================================
+ * Function: enable_interrupts
+ * Unmasks interrupts at the hardware level
+ * ============================================================ */
+void enable_interrupts(volatile uint32_t *irq_pio) {
+    /* Write 1 to interrupt enable register (or clear mask bit) */
+    *irq_pio = IRQ_ENABLE;
+    printf("    🔓 Interrupts ENABLED\n");
+    micro_delay(100);
+}
+
+/* ============================================================
+ * Function: process_interrupt
+ * Handles the interrupt: writes message, verifies, updates LED
+ * Returns: 1 if handshake successful, 0 otherwise
+ * ============================================================ */
+int process_interrupt(uint32_t irq_count,
+                      volatile uint32_t *pio_ctrl_reg,
+                      volatile uint32_t *pio_status_reg,
+                      volatile uint32_t *led_pio,
+                      volatile uint32_t *irq_pio,
+                      uint32_t *led_pattern) {
+    
+    int handshake_ok = 0;
+    uint32_t message;
+    
+    printf("\n");
+    printf("═══════════════════════════════════════════════════════════════\n");
+    printf("  🔔 INTERRUPT RECEIVED! Count: %u\n", irq_count);
+    printf("═══════════════════════════════════════════════════════════════\n");
+    
+    /* ---- Step 1: DISABLE interrupts while processing ---- */
+    disable_interrupts(irq_pio);
+    
+    /* ---- Step 2: Write START marker to control register ---- */
+    handshake_ok = verify_hardware_handshake(pio_ctrl_reg, 
+                                              pio_status_reg, 
+                                              IRQ_MSG_START);
+    
+    if (!handshake_ok) {
+        printf("    ❌ START marker handshake failed!\n");
+        goto handshake_failed;
+    }
+    
+    /* ---- Step 3: Write interrupt count ---- */
+    message = irq_count & 0xFF;
+    handshake_ok = verify_hardware_handshake(pio_ctrl_reg, 
+                                              pio_status_reg, 
+                                              message);
+    
+    if (!handshake_ok) {
+        printf("    ❌ COUNT marker handshake failed!\n");
+        goto handshake_failed;
+    }
+    
+    /* ---- Step 4: Write END marker ---- */
+    handshake_ok = verify_hardware_handshake(pio_ctrl_reg, 
+                                              pio_status_reg, 
+                                              IRQ_MSG_END);
+    
+    if (!handshake_ok) {
+        printf("    ❌ END marker handshake failed!\n");
+        goto handshake_failed;
+    }
+    
+    /* ---- Step 5: ALL HANDSHAKES SUCCESSFUL! ---- */
+    printf("    ✅ ALL HANDSHAKES SUCCESSFUL!\n");
+    
+    /* Update LED pattern (visual confirmation) */
+    *led_pio = *led_pattern;
+    printf("    [WRITE] LED Pattern: 0x%02X\n", *led_pattern);
+    
+    /* Rotate pattern for next interrupt */
+    *led_pattern = ((*led_pattern << 1) & 0xF) | ((*led_pattern >> 3) & 0x1);
+    
+    /* Re-arm UIO interrupt */
+    printf("    ✅ Interrupt processed and serviced.\n");
+    
+handshake_failed:
+    /* ---- Step 6: ENABLE interrupts for next event ---- */
+    enable_interrupts(irq_pio);
+    
+    printf("═══════════════════════════════════════════════════════════════\n");
+    printf("\n");
+    
+    return handshake_ok;
+}
+
+/* ============================================================
+ * MAIN FUNCTION
+ * ============================================================ */
+int main() {
+    int fd;
+    uint32_t irq_count = 0;
+    uint32_t led_pattern = LED_PATTERN_START;
+    uint32_t handshake_failures = 0;
+    uint32_t total_interrupts = 0;
+    
+    volatile uint32_t *fpga_regs;
+    volatile uint32_t *led_pio;
+    volatile uint32_t *pio_ctrl_reg;
+    volatile uint32_t *pio_status_reg;
+    volatile uint32_t *button_pio;
+    volatile uint32_t *dipsw_pio;
+    volatile uint32_t *irq_pio;
+    
+    /* ---- 1. Open UIO device ---- */
+    fd = open(UIO_DEVICE, O_RDWR);
+    if (fd < 0) {
+        perror("Cannot open UIO device");
+        return -1;
+    }
+    
+    /* ---- 2. Memory-map FPGA register space ---- */
+    fpga_regs = (volatile uint32_t *)mmap(NULL, FPGA_REG_SIZE,
+                                          PROT_READ | PROT_WRITE,
+                                          MAP_SHARED, fd, 0);
+    
+    if (fpga_regs == MAP_FAILED) {
+        perror("mmap failed");
+        close(fd);
+        return -1;
+    }
+    
+    /* ---- 3. Set up register pointers ---- */
+    led_pio       = (volatile uint32_t *)((uintptr_t)fpga_regs + LED_PIO_OFFSET);
+    pio_ctrl_reg  = (volatile uint32_t *)((uintptr_t)fpga_regs + PIO_CTRL_REG_OFFSET);
+    pio_status_reg= (volatile uint32_t *)((uintptr_t)fpga_regs + PIO_STATUS_REG_OFFSET);
+    button_pio    = (volatile uint32_t *)((uintptr_t)fpga_regs + BUTTON_PIO_OFFSET);
+    dipsw_pio     = (volatile uint32_t *)((uintptr_t)fpga_regs + DIPSW_PIO_OFFSET);
+    irq_pio       = (volatile uint32_t *)((uintptr_t)fpga_regs + IRQ_PIO_OFFSET);
+    
+    /* ---- 4. Initial state ---- */
+    *led_pio = LED_ALL_OFF;
+    *pio_ctrl_reg = IRQ_MSG_IDLE;
+    *pio_status_reg = IRQ_MSG_IDLE;
+    
+    /* Enable interrupts initially */
+    enable_interrupts(irq_pio);
+    
+    printf("============================================================\n");
+    printf("  HARDWARE HANDSHAKE INTERRUPT HANDLER\n");
+    printf("============================================================\n");
+    printf("  UIO Device: %s\n", UIO_DEVICE);
+    printf("  LED PIO:    0x%08X\n", LED_PIO_BASE);
+    printf("  CTRL Reg:   0x%08X\n", PIO_CTRL_REG_BASE);
+    printf("  STATUS Reg: 0x%08X\n", PIO_STATUS_REG_BASE);
+    printf("  IRQ PIO:    0x%08X\n", IRQ_PIO_BASE);
+    printf("\n");
+    printf("  Press a button to trigger an interrupt.\n");
+    printf("  Each interrupt will be verified via hardware handshake.\n");
+    printf("============================================================\n");
+    printf("\n");
+    
+    /* ---- 5. Main ISR loop ---- */
+    while (1) {
+        /* Block until FPGA interrupt fires */
+        if (read(fd, &irq_count, sizeof(irq_count)) < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("read failed");
+            break;
+        }
+        
+        total_interrupts++;
+        
+        /* ---- 6. Process interrupt with handshake ---- */
+        int success = process_interrupt(irq_count,
+                                        pio_ctrl_reg,
+                                        pio_status_reg,
+                                        led_pio,
+                                        irq_pio,
+                                        &led_pattern);
+        
+        if (!success) {
+            handshake_failures++;
+            printf("  ⚠️  Handshake FAILED for interrupt %u (Total failures: %u)\n", 
+                   irq_count, handshake_failures);
+        }
+        
+        /* ---- 7. Re-arm UIO interrupt ---- */
+        if (write(fd, &irq_count, sizeof(irq_count)) < 0) {
+            perror("write (re-arm) failed");
+            break;
+        }
+    }
+    
+    /* ---- 8. Cleanup ---- */
+    *led_pio = LED_ALL_OFF;
+    *pio_ctrl_reg = IRQ_MSG_IDLE;
+    *pio_status_reg = IRQ_MSG_IDLE;
+    
+    munmap((void *)fpga_regs, FPGA_REG_SIZE);
+    close(fd);
+    
+    printf("\n============================================================\n");
+    printf("  INTERRUPT HANDLER STOPPED\n");
+    printf("  Total interrupts: %u\n", total_interrupts);
+    printf("  Handshake failures: %u\n", handshake_failures);
+    printf("============================================================\n");
+    
+    return 0;
+}
+
+//==========================================================================================================================================================================
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <fcntl.h>
